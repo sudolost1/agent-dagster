@@ -13,6 +13,7 @@ from app.config import get_editable, update_editable
 from app.context import get_history
 from app.logbuffer import get_logs
 from app.tasklog import get_task_log
+from app import buildlog
 
 router = APIRouter()
 
@@ -72,6 +73,35 @@ def queue_log(limit: int = 100) -> list[dict[str, Any]]:
     """Return a log of completed tasks with result, processing time, and receipt timestamp."""
     return get_task_log(limit=limit)
 
+
+# ---------------------------------------------------------------------------
+# Build log endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/build-logs")
+def list_all_builds(limit: int = 50) -> list[dict[str, str]]:
+    """List recent builds across all projects, most recent first."""
+    return buildlog.list_builds(limit=limit)
+
+
+@router.get("/build-logs/{project}/{job}")
+def list_job_builds(project: str, job: str, limit: int = 50) -> list[dict[str, str]]:
+    """List builds for a specific project/job."""
+    return buildlog.list_builds_for_job(project, job, limit=limit)
+
+
+@router.get("/build-logs/{project}/{job}/{build_id}")
+def get_build(project: str, job: str, build_id: str) -> dict:
+    """Return full step-by-step history for a specific build."""
+    result = buildlog.get_build_log(project, job, build_id)
+    if not result["meta"]:
+        raise HTTPException(status_code=404, detail=f"Build '{build_id}' not found")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Config key CRUD (catch-all -- must come last)
+# ---------------------------------------------------------------------------
 
 @router.get("/{key}")
 def get_config_key(key: str) -> dict[str, Any]:

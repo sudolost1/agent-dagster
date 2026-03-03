@@ -12,6 +12,12 @@ pydantic = "*"
 pika = "*"
 fastmcp = "*"
 redis = "*"
+dagster = "*"
+dagster-webserver = "*"
+dagster-docker = "*"
+dagster-graphql = "*"
+dagster-postgres = "*"
+psycopg2-binary = "*"
 
 [dev-packages]
 pytest = "*"

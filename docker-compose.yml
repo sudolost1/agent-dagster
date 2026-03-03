@@ -1,44 +1,108 @@
 services:
-  rabbitmq:
-    extends:
-      file: ../agent-queue/docker-compose.yml
-      service: rabbitmq
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  cache:
-    image: redis:7-alpine
-    container_name: agent-cache
-    hostname: agent-cache
-    ports:
-      - "6379:6379"
-    volumes:
-      - ../cache/redis.conf:/usr/local/etc/redis/redis.conf:ro
-      - redis_data:/data
-    command: redis-server /usr/local/etc/redis/redis.conf
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  agent-dagster:
-    build: .
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./config.yaml:/app/config.yaml
+  dagster-db:
+    image: postgres:16
+    container_name: dagster-db
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - CONFIG_PATH=config.yaml
+      POSTGRES_USER: dagster
+      POSTGRES_PASSWORD: dagster
+      POSTGRES_DB: dagster
+    volumes:
+      - dagster_pg_data:/var/lib/postgresql/data
+    networks:
+      - dagster-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dagster -d dagster"]
+      interval: 10s
+      timeout: 8s
+      retries: 5
+
+  code-location:
+    build:
+      context: .
+      dockerfile: Dockerfile.code
+    container_name: dagster-code-location
+    image: dagster_code_location_image
+    restart: always
+    environment:
+      DAGSTER_POSTGRES_HOST: dagster-db
+      DAGSTER_POSTGRES_PORT: "5432"
+      DAGSTER_POSTGRES_USER: dagster
+      DAGSTER_POSTGRES_PASSWORD: dagster
+      DAGSTER_POSTGRES_DB: dagster
+      DAGSTER_CURRENT_IMAGE: dagster_code_location_image
+      PIPELINES_DIR: /opt/dagster/app/pipelines
+    volumes:
+      - pipelines:/opt/dagster/app/pipelines
+    networks:
+      - dagster-network
     depends_on:
-      rabbitmq:
+      dagster-db:
         condition: service_healthy
-      cache:
+
+  dagster-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.dagster
+    container_name: dagster-webserver
+    entrypoint:
+      - dagster-webserver
+      - -h
+      - "0.0.0.0"
+      - -p
+      - "3000"
+      - -w
+      - workspace.yaml
+    ports:
+      - "3000:3000"
+    environment:
+      DAGSTER_POSTGRES_HOST: dagster-db
+      DAGSTER_POSTGRES_PORT: "5432"
+      DAGSTER_POSTGRES_USER: dagster
+      DAGSTER_POSTGRES_PASSWORD: dagster
+      DAGSTER_POSTGRES_DB: dagster
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/io_manager_storage:/tmp/io_manager_storage
+    networks:
+      - dagster-network
+    depends_on:
+      dagster-db:
         condition: service_healthy
+      code-location:
+        condition: service_healthy
+
+  dagster-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile.dagster
+    container_name: dagster-daemon
+    entrypoint:
+      - dagster-daemon
+      - run
+    restart: on-failure
+    environment:
+      DAGSTER_POSTGRES_HOST: dagster-db
+      DAGSTER_POSTGRES_PORT: "5432"
+      DAGSTER_POSTGRES_USER: dagster
+      DAGSTER_POSTGRES_PASSWORD: dagster
+      DAGSTER_POSTGRES_DB: dagster
+      DAGSTER_NETWORK: dagster-network
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/io_manager_storage:/tmp/io_manager_storage
+    networks:
+      - dagster-network
+    depends_on:
+      dagster-db:
+        condition: service_healthy
+      code-location:
+        condition: service_started
 
 volumes:
-  redis_data:
+  dagster_pg_data:
+  pipelines:
+
+networks:
+  dagster-network:
+    driver: bridge
+    name: dagster-network

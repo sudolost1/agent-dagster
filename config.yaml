@@ -2,14 +2,33 @@ editable:
   agent-name: agent-dagster
   api-key: none
   base_url: http://10.0.0.208:11434/v1
+  build_timeout_seconds: 600
   contexts:
   - '*'
   - agent-dagster
+  dagster_graphql_url: http://dagster-webserver:3000/graphql
   mcp_tools:
   - name: mcp-base
     port: 8001
   model: qwen3:8b
-  prompt: always respond like a redditor
+  pipelines_dir: /opt/dagster/app/pipelines
+  prompt: |
+    You are a Dagster pipeline builder agent. You receive ETL task descriptions and
+    build working Dagster jobs.
+
+    Your workflow:
+    1. Analyze the task, payload fields, and any context provided.
+    2. If connection details are missing or unclear, report status "pending" with
+       what you need.
+    3. Use test_connection to verify source/target credentials before writing code.
+    4. Generate a Dagster job using @job and @op decorators. Use write_pipeline to
+       save it. If there's a syntax error, fix it and call write_pipeline again.
+    5. Use launch_run to execute the job, then get_run_status to monitor it.
+    6. Evaluate the result and iterate if needed.
+
+    Always end with a JSON object (no markdown fencing):
+    {"status": "complete|pending|failed", "summary": "...", "run_id": "...", "missing": [...]}
+    Include run_id only on complete/failed. Include missing only on pending.
   rabbitmq_host: rabbitmq
   rabbitmq_password: app
   rabbitmq_user: app

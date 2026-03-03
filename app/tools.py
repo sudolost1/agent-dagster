@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import json
+import logging
+import os
+import urllib.request
+from pathlib import Path
+
+from app.config import get_editable
+
+log = logging.getLogger(__name__)
+
+PIPELINES_DIR_DEFAULT = "/opt/dagster/app/pipelines"
+
+
+def _pipelines_dir() -> Path:
+    return Path(get_editable().get("pipelines_dir", PIPELINES_DIR_DEFAULT))
+
+
+def _graphql_url() -> str:
+    return get_editable().get("dagster_graphql_url", "http://dagster-webserver:3000/graphql")
+
+
+# ---------------------------------------------------------------------------
+# Tool: test_connection
+# ---------------------------------------------------------------------------
+
+def test_connection(type: str, host: str, port: int, database: str, user: str, password: str) -> str:
+    """Attempt a real connection to a database and return success or the error."""
+    try:
+        if type in ("postgres", "postgresql"):
+            import psycopg2
+            conn = psycopg2.connect(
+                host=host, port=port, dbname=database, user=user, password=password,
+                connect_timeout=10,
+            )
+            conn.close()
+            return json.dumps({"success": True, "message": f"Connected to {type}://{host}:{port}/{database}"})
+        return json.dumps({"success": False, "message": f"Unsupported connection type: {type}"})
+    except Exception as exc:
+        return json.dumps({"success": False, "message": str(exc)})
+
+
+TEST_CONNECTION_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "test_connection",
+        "description": "Test a database connection. Returns success or error message.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "description": "Database type, e.g. 'postgres'"},
+                "host": {"type": "string"},
+                "port": {"type": "integer"},
+                "database": {"type": "string"},
+                "user": {"type": "string"},
+                "password": {"type": "string"},
+            },
+            "required": ["type", "host", "port", "database", "user", "password"],
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Tool: write_pipeline
+# ---------------------------------------------------------------------------
+
+def write_pipeline(project_name: str, job_name: str, code: str) -> str:
+    """Validate syntax and write a Dagster pipeline file to the persistent volume."""
+    safe_project = project_name.replace("/", "_").replace("..", "_")
+    safe_job = job_name.replace("/", "_").replace("..", "_")
+
+    try:
+        compile(code, f"{safe_job}.py", "exec")
+    except SyntaxError as exc:
+        return json.dumps({"success": False, "error": f"Syntax error at line {exc.lineno}: {exc.msg}"})
+
+    base = _pipelines_dir() / safe_project
+    base.mkdir(parents=True, exist_ok=True)
+
+    init_file = base / "__init__.py"
+    if not init_file.exists():
+        init_file.write_text("")
+
+    target = base / f"{safe_job}.py"
+    target.write_text(code)
+    log.info("Wrote pipeline to %s", target)
+    return json.dumps({"success": True, "path": str(target)})
+
+
+WRITE_PIPELINE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "write_pipeline",
+        "description": (
+            "Validate Python syntax and write a Dagster job file to the pipelines volume. "
+            "Returns the file path on success or the syntax error."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_name": {"type": "string", "description": "Project subdirectory name"},
+                "job_name": {"type": "string", "description": "Job module filename (without .py)"},
+                "code": {"type": "string", "description": "Full Python source code for the Dagster job"},
+            },
+            "required": ["project_name", "job_name", "code"],
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Tool: launch_run
+# ---------------------------------------------------------------------------
+
+def _graphql_request(query: str, variables: dict | None = None) -> dict:
+    payload = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = urllib.request.Request(
+        _graphql_url(),
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def launch_run(project_name: str, job_name: str) -> str:
+    """Launch a Dagster job run via the GraphQL API."""
+    safe_job = job_name.replace("-", "_")
+    query = """
+    mutation LaunchRun($selector: JobOrPipelineSelector!) {
+      launchRun(executionParams: {selector: $selector}) {
+        __typename
+        ... on LaunchRunSuccess {
+          run { runId status }
+        }
+        ... on PythonError {
+          message
+        }
+        ... on RunConfigValidationInvalid {
+          errors { message }
+        }
+      }
+    }
+    """
+    variables = {
+        "selector": {
+            "repositoryLocationName": "code-location",
+            "repositoryName": "__repository__",
+            "jobName": safe_job,
+        }
+    }
+    try:
+        data = _graphql_request(query, variables)
+        result = data.get("data", {}).get("launchRun", {})
+        typename = result.get("__typename", "")
+        if typename == "LaunchRunSuccess":
+            run = result["run"]
+            return json.dumps({"success": True, "run_id": run["runId"], "status": run["status"]})
+        errors = result.get("errors", [result.get("message", "Unknown error")])
+        return json.dumps({"success": False, "error": str(errors)})
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)})
+
+
+LAUNCH_RUN_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "launch_run",
+        "description": "Launch a Dagster job run via GraphQL. Returns the run_id on success.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_name": {"type": "string", "description": "Project name (for context)"},
+                "job_name": {"type": "string", "description": "Dagster job name to launch"},
+            },
+            "required": ["project_name", "job_name"],
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_run_status
+# ---------------------------------------------------------------------------
+
+def get_run_status(run_id: str) -> str:
+    """Query a Dagster run's status and recent log events."""
+    query = """
+    query RunStatus($runId: ID!) {
+      runOrError(runId: $runId) {
+        __typename
+        ... on Run {
+          runId
+          status
+          stats {
+            ... on RunStatsSnapshot {
+              stepsSucceeded
+              stepsFailed
+              startTime
+              endTime
+            }
+          }
+        }
+        ... on RunNotFoundError {
+          message
+        }
+        ... on PythonError {
+          message
+        }
+      }
+    }
+    """
+    try:
+        data = _graphql_request(query, {"runId": run_id})
+        result = data.get("data", {}).get("runOrError", {})
+        typename = result.get("__typename", "")
+        if typename == "Run":
+            return json.dumps({
+                "run_id": result["runId"],
+                "status": result["status"],
+                "stats": result.get("stats", {}),
+            })
+        return json.dumps({"error": result.get("message", "Unknown error")})
+    except Exception as exc:
+        return json.dumps({"error": str(exc)})
+
+
+GET_RUN_STATUS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "get_run_status",
+        "description": "Query the status of a Dagster run by run_id. Returns status, step counts, and timing.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string", "description": "The Dagster run ID"},
+            },
+            "required": ["run_id"],
+        },
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Registry: all local tools
+# ---------------------------------------------------------------------------
+
+LOCAL_TOOLS: dict[str, callable] = {
+    "test_connection": test_connection,
+    "write_pipeline": write_pipeline,
+    "launch_run": launch_run,
+    "get_run_status": get_run_status,
+}
+
+LOCAL_TOOL_SCHEMAS: list[dict] = [
+    TEST_CONNECTION_SCHEMA,
+    WRITE_PIPELINE_SCHEMA,
+    LAUNCH_RUN_SCHEMA,
+    GET_RUN_STATUS_SCHEMA,
+]

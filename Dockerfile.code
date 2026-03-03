@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir \
+    dagster \
+    dagster-postgres \
+    dagster-docker \
+    psycopg2-binary
+
+WORKDIR /opt/dagster/app
+
+COPY dagster/definitions.py /opt/dagster/app/definitions.py
+
+RUN mkdir -p /opt/dagster/app/pipelines
+
+EXPOSE 4000
+
+HEALTHCHECK --timeout=3s --start-period=5s --interval=5s --retries=10 \
+    CMD ["dagster", "api", "grpc-health-check", "-p", "4000"]
+
+CMD ["dagster", "code-server", "start", "-h", "0.0.0.0", "-p", "4000", "-f", "definitions.py"]

@@ -6,6 +6,7 @@ import logging
 import socket
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -15,6 +16,7 @@ from fastapi import FastAPI
 
 from app.agent import Agent
 from app.api import router
+from app import buildlog
 from app.config import get_editable, load_config
 from app.context import load_history
 from app.logbuffer import BufferHandler, init_redis as init_log_redis
@@ -29,12 +31,11 @@ agent = Agent()
 
 
 def _queue_name() -> str:
-    name = get_editable().get("agent-name", "agent-base")
+    name = get_editable().get("agent-name", "agent-dagster")
     return f"q.tasks.{name}"
 
 
 def _connect(host: str, user: str = "guest", password: str = "guest") -> pika.BlockingConnection:
-    """Try to connect to RabbitMQ with back-off retries."""
     credentials = pika.PlainCredentials(user, password)
     params = pika.ConnectionParameters(host=host, credentials=credentials)
     for attempt in range(1, 11):
@@ -52,6 +53,15 @@ def _connect(host: str, user: str = "guest", password: str = "guest") -> pika.Bl
 _task_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 
+def _build_response(payload: dict, response_obj: dict, agent_name: str) -> str:
+    return json.dumps({
+        "task": payload,
+        "response": response_obj,
+        "source": agent_name,
+        "container_id": socket.gethostname(),
+    })
+
+
 def _on_message(
     ch: pika.adapters.blocking_connection.BlockingChannel,
     method: pika.spec.Basic.Deliver,
@@ -60,7 +70,7 @@ def _on_message(
 ) -> None:
     cfg = get_editable()
     timeout = cfg.get("task_timeout_seconds", 300)
-    agent_name = cfg.get("agent-name", "agent-base")
+    agent_name = cfg.get("agent-name", "agent-dagster")
     received_at = datetime.now(tz=timezone.utc)
 
     try:
@@ -72,22 +82,48 @@ def _on_message(
 
     source = payload.get("source")
     task_text = payload.get("task")
+    project_name = payload.get("project-name")
+    job_name = payload.get("job-name")
 
-    if not source or not task_text:
-        log.error("Payload missing required 'source' or 'task' key, rejecting")
+    if not source or not task_text or not project_name or not job_name:
+        log.error("Payload missing required keys (source, task, project-name, job-name), rejecting")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
         return
 
-    log.info("Received task from '%s': %s", source, task_text[:200])
-    future = _task_executor.submit(agent.run, task_text)
+    build_id = str(uuid.uuid4())
+    container_id = socket.gethostname()
+    log.info("Build %s: received task from '%s' for %s/%s", build_id, source, project_name, job_name)
+
+    buildlog.start_build(build_id, project_name, job_name, container_id)
+
+    user_message = json.dumps(payload, indent=2)
+
+    future = _task_executor.submit(
+        agent.run,
+        user_message,
+        build_id=build_id,
+        project_name=project_name,
+        job_name=job_name,
+    )
     start = time.monotonic()
     try:
-        result = future.result(timeout=timeout)
+        result_text = future.result(timeout=timeout)
         processing_time = time.monotonic() - start
-        log.info("Agent result: %s", result[:500])
+        log.info("Build %s: agent returned: %s", build_id, result_text[:500])
+
+        # parse structured JSON from agent
+        try:
+            response_obj = json.loads(result_text)
+        except (json.JSONDecodeError, TypeError):
+            response_obj = {"status": "complete", "summary": result_text}
+
+        response_obj["build_id"] = build_id
+        status = response_obj.get("status", "complete")
+        buildlog.finish_build(build_id, project_name, job_name, status)
+
         record_task(
             task=task_text,
-            result=result,
+            result=result_text,
             processing_time_s=processing_time,
             received_at=received_at,
         )
@@ -98,28 +134,26 @@ def _on_message(
             durable=True,
             arguments={"x-queue-type": "quorum"},
         )
-        response_payload = json.dumps({
-            "task": task_text,
-            "response": result,
-            "source": agent_name,
-            "container_id": socket.gethostname(),
-        })
         ch.basic_publish(
             exchange="",
             routing_key=response_queue,
-            body=response_payload,
+            body=_build_response(payload, response_obj, agent_name),
             properties=pika.BasicProperties(delivery_mode=2),
         )
-        log.info("Published response to queue '%s'", response_queue)
+        log.info("Build %s: published response to '%s' with status '%s'", build_id, response_queue, status)
+
     except concurrent.futures.TimeoutError:
         future.cancel()
-        log.error("Task timed out after %ds, requeuing", timeout)
+        log.error("Build %s: task timed out after %ds, requeuing", build_id, timeout)
+        buildlog.finish_build(build_id, project_name, job_name, "timeout")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
         return
     except Exception:
-        log.exception("Failed to process task")
+        log.exception("Build %s: failed to process task", build_id)
+        buildlog.finish_build(build_id, project_name, job_name, "error")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
         return
+
     ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
@@ -138,7 +172,7 @@ def _consume() -> None:
     queue = _queue_name()
     channel.queue_declare(queue=queue, durable=True, arguments={"x-queue-type": "quorum"})
 
-    routing_key = cfg.get("agent-name", "agent-base")
+    routing_key = cfg.get("agent-name", "agent-dagster")
     channel.queue_bind(queue=queue, exchange="tasks.x", routing_key=routing_key)
     log.info("Bound '%s' to tasks.x with routing key '%s'", queue, routing_key)
 
@@ -160,6 +194,7 @@ async def lifespan(app: FastAPI):
     )
     init_log_redis(redis_client)
     init_task_redis(redis_client)
+    buildlog.init_redis(redis_client)
     load_history()
     start_heartbeat("agent")
     consumer = threading.Thread(target=_consume, daemon=True)

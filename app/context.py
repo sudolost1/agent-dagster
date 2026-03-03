@@ -111,3 +111,75 @@ def build_prefix() -> str:
         return ""
 
     return "--- Context ---\n" + "\n".join(lines) + "\n--- End Context ---\n\n"
+
+
+def build_prefix_with_ids() -> tuple[str, dict[str, str]]:
+    """Like build_prefix but also returns a map of stream -> last message ID.
+
+    Used by the extended build loop to establish the baseline for incremental
+    context refresh via ``get_new_entries``.
+    """
+    cfg = get_editable()
+    contexts: list[str] = cfg.get("contexts", [])
+    if not contexts:
+        return "", {}
+
+    r = _get_client()
+    lines: list[str] = []
+    last_ids: dict[str, str] = {}
+    for ctx in contexts:
+        key = _stream_key(ctx)
+        try:
+            entries: list[tuple[str, dict[str, Any]]] = r.xrange(key)
+            for msg_id, fields in entries:
+                last_ids[ctx] = msg_id
+                content = fields.get("content", "")
+                if content:
+                    lines.append(f"[{ctx}] {content}")
+        except redis_lib.RedisError:
+            log.warning("Could not read context stream '%s'", ctx, exc_info=True)
+
+    prefix = ""
+    if lines:
+        prefix = "--- Context ---\n" + "\n".join(lines) + "\n--- End Context ---\n\n"
+    return prefix, last_ids
+
+
+def get_new_entries(last_ids: dict[str, str]) -> tuple[list[dict[str, str]], dict[str, str]]:
+    """Read new entries from subscribed context streams since ``last_ids``.
+
+    Returns a list of new entries and an updated last_ids map.
+    """
+    cfg = get_editable()
+    contexts: list[str] = cfg.get("contexts", [])
+    if not contexts:
+        return [], last_ids
+
+    r = _get_client()
+    streams: dict[str, str] = {}
+    for ctx in contexts:
+        key = _stream_key(ctx)
+        streams[key] = last_ids.get(ctx, "0-0")
+
+    new_entries: list[dict[str, str]] = []
+    updated_ids = dict(last_ids)
+
+    try:
+        results = r.xread(streams, count=100, block=0)
+    except redis_lib.RedisError:
+        log.warning("Failed to XREAD context streams", exc_info=True)
+        return [], last_ids
+
+    if not results:
+        return [], last_ids
+
+    key_to_ctx = {_stream_key(ctx): ctx for ctx in contexts}
+    for stream_key, entries in results:
+        ctx = key_to_ctx.get(stream_key, stream_key)
+        for msg_id, fields in entries:
+            updated_ids[ctx] = msg_id
+            content = fields.get("content", "")
+            if content:
+                new_entries.append({"stream": ctx, "id": msg_id, "content": content})
+
+    return new_entries, updated_ids
