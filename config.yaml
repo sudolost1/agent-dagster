@@ -1,0 +1,21 @@
+editable:
+  agent-name: agent-dagster
+  api-key: none
+  base_url: http://10.0.0.208:11434/v1
+  contexts:
+  - '*'
+  - agent-dagster
+  mcp_tools:
+  - name: mcp-base
+    port: 8001
+  model: qwen3:8b
+  prompt: always respond like a redditor
+  rabbitmq_host: rabbitmq
+  rabbitmq_password: app
+  rabbitmq_user: app
+  redis_host: cache
+  redis_port: 6379
+  task_timeout_seconds: 300
+static:
+  app_name: agent-dagster
+  version: 0.1.0

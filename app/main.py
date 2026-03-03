@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import logging
+import socket
+import threading
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+import pika
+import redis as redis_lib
+from fastapi import FastAPI
+
+from app.agent import Agent
+from app.api import router
+from app.config import get_editable, load_config
+from app.context import load_history
+from app.logbuffer import BufferHandler, init_redis as init_log_redis
+from app.registry import start_heartbeat
+from app.tasklog import init_redis as init_task_redis, record_task
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger().addHandler(BufferHandler())
+log = logging.getLogger(__name__)
+
+agent = Agent()
+
+
+def _queue_name() -> str:
+    name = get_editable().get("agent-name", "agent-base")
+    return f"q.tasks.{name}"
+
+
+def _connect(host: str, user: str = "guest", password: str = "guest") -> pika.BlockingConnection:
+    """Try to connect to RabbitMQ with back-off retries."""
+    credentials = pika.PlainCredentials(user, password)
+    params = pika.ConnectionParameters(host=host, credentials=credentials)
+    for attempt in range(1, 11):
+        try:
+            conn = pika.BlockingConnection(params)
+            log.info("Connected to RabbitMQ at %s", host)
+            return conn
+        except (pika.exceptions.AMQPConnectionError, OSError):
+            wait = min(attempt * 2, 30)
+            log.warning("RabbitMQ not ready (attempt %d/10), retrying in %ds…", attempt, wait)
+            time.sleep(wait)
+    raise RuntimeError(f"Could not connect to RabbitMQ at {host} after 10 attempts")
+
+
+_task_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+
+def _on_message(
+    ch: pika.adapters.blocking_connection.BlockingChannel,
+    method: pika.spec.Basic.Deliver,
+    _properties: pika.spec.BasicProperties,
+    body: bytes,
+) -> None:
+    cfg = get_editable()
+    timeout = cfg.get("task_timeout_seconds", 300)
+    agent_name = cfg.get("agent-name", "agent-base")
+    received_at = datetime.now(tz=timezone.utc)
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        log.error("Invalid JSON payload, rejecting message")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        return
+
+    source = payload.get("source")
+    task_text = payload.get("task")
+
+    if not source or not task_text:
+        log.error("Payload missing required 'source' or 'task' key, rejecting")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        return
+
+    log.info("Received task from '%s': %s", source, task_text[:200])
+    future = _task_executor.submit(agent.run, task_text)
+    start = time.monotonic()
+    try:
+        result = future.result(timeout=timeout)
+        processing_time = time.monotonic() - start
+        log.info("Agent result: %s", result[:500])
+        record_task(
+            task=task_text,
+            result=result,
+            processing_time_s=processing_time,
+            received_at=received_at,
+        )
+
+        response_queue = f"q.tasks.{source}"
+        ch.queue_declare(
+            queue=response_queue,
+            durable=True,
+            arguments={"x-queue-type": "quorum"},
+        )
+        response_payload = json.dumps({
+            "task": task_text,
+            "response": result,
+            "source": agent_name,
+            "container_id": socket.gethostname(),
+        })
+        ch.basic_publish(
+            exchange="",
+            routing_key=response_queue,
+            body=response_payload,
+            properties=pika.BasicProperties(delivery_mode=2),
+        )
+        log.info("Published response to queue '%s'", response_queue)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        log.error("Task timed out after %ds, requeuing", timeout)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        return
+    except Exception:
+        log.exception("Failed to process task")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+        return
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+
+def _consume() -> None:
+    cfg = get_editable()
+    host = cfg.get("rabbitmq_host", "rabbitmq")
+    user = cfg.get("rabbitmq_user", "guest")
+    password = cfg.get("rabbitmq_password", "guest")
+    try:
+        connection = _connect(host, user, password)
+    except RuntimeError:
+        log.warning("RabbitMQ unavailable — running without task consumer")
+        return
+    channel = connection.channel()
+
+    queue = _queue_name()
+    channel.queue_declare(queue=queue, durable=True, arguments={"x-queue-type": "quorum"})
+
+    routing_key = cfg.get("agent-name", "agent-base")
+    channel.queue_bind(queue=queue, exchange="tasks.x", routing_key=routing_key)
+    log.info("Bound '%s' to tasks.x with routing key '%s'", queue, routing_key)
+
+    channel.basic_qos(prefetch_count=1)
+    channel.basic_consume(queue=queue, on_message_callback=_on_message)
+
+    log.info("Consuming from queue '%s'", queue)
+    channel.start_consuming()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_config()
+    cfg = get_editable()
+    redis_client = redis_lib.Redis(
+        host=cfg.get("redis_host", "cache"),
+        port=int(cfg.get("redis_port", 6379)),
+        decode_responses=True,
+    )
+    init_log_redis(redis_client)
+    init_task_redis(redis_client)
+    load_history()
+    start_heartbeat("agent")
+    consumer = threading.Thread(target=_consume, daemon=True)
+    consumer.start()
+    yield
+
+
+app = FastAPI(title="agent-dagster", lifespan=lifespan)
+app.include_router(router)
