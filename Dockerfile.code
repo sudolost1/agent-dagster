@@ -4,7 +4,9 @@ RUN pip install --no-cache-dir \
     dagster \
     dagster-postgres \
     dagster-docker \
-    psycopg2-binary
+    psycopg2-binary \
+    dlt[duckdb] \
+    duckdb
 
 WORKDIR /opt/dagster/app
 

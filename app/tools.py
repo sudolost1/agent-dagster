@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from app.config import get_editable
 log = logging.getLogger(__name__)
 
 PIPELINES_DIR_DEFAULT = "/opt/dagster/app/pipelines"
+TEST_CONNECTION_TIMEOUT = 15
 
 
 def _pipelines_dir() -> Path:
@@ -24,32 +26,67 @@ def _graphql_url() -> str:
 # ---------------------------------------------------------------------------
 # Tool: test_connection
 # ---------------------------------------------------------------------------
+# Uses SQLAlchemy with connection strings in the same format as dlt sql_database.
+# This avoids custom handlers per DB type; any SQLAlchemy-supported backend works.
+
+# SQLAlchemy driver names (same as dlt sql_database). Requires: postgres->psycopg2, mysql->pymysql.
+_DRIVER_MAP = {
+    "postgres": "postgresql+psycopg2",
+    "postgresql": "postgresql+psycopg2",
+    "mysql": "mysql+pymysql",
+}
+
+
+def _connection_string(
+    type: str, host: str, port: int, database: str, user: str, password: str
+) -> str:
+    """Build SQLAlchemy URL (same format as dlt sql_database)."""
+    from urllib.parse import quote_plus
+
+    driver = _DRIVER_MAP.get(type.lower() if type else "", "")
+    if not driver:
+        raise ValueError(f"Unsupported connection type: {type}. Supported: {list(_DRIVER_MAP.keys())}")
+    safe_password = quote_plus(password)
+    return f"{driver}://{user}:{safe_password}@{host}:{port}/{database}"
+
+
+def _do_test_connection(type: str, host: str, port: int, database: str, user: str, password: str) -> str:
+    from sqlalchemy import create_engine, text
+
+    url = _connection_string(type, host, port, database, user, password)
+    engine = create_engine(url, connect_args={"connect_timeout": 10})
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return json.dumps({
+        "success": True,
+        "message": f"Connected to {type}://{host}:{port}/{database}",
+    })
+
 
 def test_connection(type: str, host: str, port: int, database: str, user: str, password: str) -> str:
-    """Attempt a real connection to a database and return success or the error."""
-    try:
-        if type in ("postgres", "postgresql"):
-            import psycopg2
-            conn = psycopg2.connect(
-                host=host, port=port, dbname=database, user=user, password=password,
-                connect_timeout=10,
-            )
-            conn.close()
-            return json.dumps({"success": True, "message": f"Connected to {type}://{host}:{port}/{database}"})
-        return json.dumps({"success": False, "message": f"Unsupported connection type: {type}"})
-    except Exception as exc:
-        return json.dumps({"success": False, "message": str(exc)})
+    """Test a database connection using SQLAlchemy (dlt-compatible format). Supports postgres, mysql."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(_do_test_connection, type, host, port, database, user, password)
+        try:
+            return future.result(timeout=TEST_CONNECTION_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            return json.dumps({
+                "success": False,
+                "message": f"Connection attempt timed out after {TEST_CONNECTION_TIMEOUT}s (host={host}, port={port})",
+            })
+        except Exception as exc:
+            return json.dumps({"success": False, "message": str(exc)})
 
 
 TEST_CONNECTION_SCHEMA = {
     "type": "function",
     "function": {
         "name": "test_connection",
-        "description": "Test a database connection. Returns success or error message.",
+        "description": "Test a database connection (SQLAlchemy/dlt-compatible). Supports postgres, postgresql, mysql. Returns success or error.",
         "parameters": {
             "type": "object",
             "properties": {
-                "type": {"type": "string", "description": "Database type, e.g. 'postgres'"},
+                "type": {"type": "string", "description": "Database type: 'postgres', 'postgresql', or 'mysql'"},
                 "host": {"type": "string"},
                 "port": {"type": "integer"},
                 "database": {"type": "string"},
@@ -125,12 +162,23 @@ def _graphql_request(query: str, variables: dict | None = None) -> dict:
         return json.loads(resp.read())
 
 
-def launch_run(project_name: str, job_name: str) -> str:
-    """Launch a Dagster job run via the GraphQL API."""
+def launch_run(
+    project_name: str,
+    job_name: str,
+    *,
+    run_config: dict | None = None,
+) -> str:
+    """Launch a Dagster job run via the GraphQL API.
+
+    Pass run_config={"val": True} for validation mode (quick test run).
+    """
     safe_job = job_name.replace("-", "_")
     query = """
-    mutation LaunchRun($selector: JobOrPipelineSelector!) {
-      launchRun(executionParams: {selector: $selector}) {
+    mutation LaunchRun($selector: JobOrPipelineSelector!, $runConfigData: RunConfigData) {
+      launchRun(executionParams: {
+        selector: $selector
+        runConfigData: $runConfigData
+      }) {
         __typename
         ... on LaunchRunSuccess {
           run { runId status }
@@ -144,12 +192,13 @@ def launch_run(project_name: str, job_name: str) -> str:
       }
     }
     """
-    variables = {
+    variables: dict = {
         "selector": {
             "repositoryLocationName": "code-location",
             "repositoryName": "__repository__",
             "jobName": safe_job,
-        }
+        },
+        "runConfigData": run_config or {},
     }
     try:
         data = _graphql_request(query, variables)

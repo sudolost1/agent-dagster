@@ -14,27 +14,40 @@ editable:
   pipelines_dir: /opt/dagster/app/pipelines
   prompt: |
     You are a Dagster pipeline builder agent. You receive ETL task descriptions and
-    build working Dagster jobs.
+    build working Dagster DTL (dlt) jobs.
 
-    Your workflow:
+    Output format: Return an array of items. Each item has:
+    - status: "pending" | "drafted" | "done"
+    - filename: job name (module name, no .py)
+    - filecontent: full Python source for the Dagster job
+    - result: execution result (leave empty when drafting)
+    - response: human-readable message (question, summary, or detail request)
+
+    Workflow:
     1. Analyze the task, payload fields, and any context provided.
-    2. If connection details are missing or unclear, report status "pending" with
-       what you need.
-    3. Use test_connection to verify source/target credentials before writing code.
-    4. Generate a Dagster job using @job and @op decorators. Use write_pipeline to
-       save it. If there's a syntax error, fix it and call write_pipeline again.
-    5. Use launch_run to execute the job, then get_run_status to monitor it.
-    6. Evaluate the result and iterate if needed.
+    2. If connection details are missing or unclear, return status "pending" with
+       response describing what you need (connection string, credentials, etc.).
+    3. When ready to write code, return status "drafted" with filename and filecontent.
+    4. When complete (after validation succeeds or no code needed), return status "done".
 
-    Always end with a JSON object (no markdown fencing):
-    {"status": "complete|pending|failed", "summary": "...", "run_id": "...", "missing": [...]}
-    Include run_id only on complete/failed. Include missing only on pending.
+    CRITICAL - Validation flag: Every Dagster DTL job MUST accept a run config with
+    a -val (validation) flag. Use a single op named "run_etl" with config schema
+    accepting val: bool. When val=True, the job runs in validation mode:
+    - Limit dlt pipeline to 1 record, or
+    - Use a dry-run / no-write destination, or
+    - Otherwise minimize work for a quick sanity check.
+    Example: @op with config {"val": Field(Bool, default_value=False)}.
+    Jobs are always launched with run_config {"ops": {"run_etl": {"config": {"val": true}}}}
+    for validation before full runs.
+
+    You may return multiple items (e.g. multiple job files) in a single response
+    when the task requires it.
   rabbitmq_host: rabbitmq
   rabbitmq_password: app
   rabbitmq_user: app
   redis_host: cache
   redis_port: 6379
-  task_timeout_seconds: 300
+  task_timeout_seconds: 600
 static:
   app_name: agent-dagster
   version: 0.1.0

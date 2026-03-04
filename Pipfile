@@ -18,6 +18,8 @@ dagster-docker = "*"
 dagster-graphql = "*"
 dagster-postgres = "*"
 psycopg2-binary = "*"
+sqlalchemy = "*"
+pymysql = "*"
 
 [dev-packages]
 pytest = "*"

@@ -1,36 +1,32 @@
+"""Dagster pipeline builder agent using structured output (no tools)."""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import time
-from typing import TypeVar
 
 from openai import OpenAI
-from pydantic import BaseModel
 
-from mcp.types import Implementation
-
-from app.config import get_config, get_editable
-from app.context import build_prefix_with_ids, get_new_entries
-from app.tools import LOCAL_TOOLS, LOCAL_TOOL_SCHEMAS
+from app.config import get_editable
+from app.context import build_prefix
+from app.schema import AgentOutput, JobStatus
 from app import buildlog
 
-T = TypeVar("T", bound=BaseModel)
 log = logging.getLogger(__name__)
 
 
 class Agent:
     """Dagster pipeline builder agent.
 
-    Extends the base agent with:
-    - Local tools (test_connection, write_pipeline, launch_run, get_run_status)
-    - Timeout-based loop (no hard iteration cap)
-    - Per-iteration context refresh from Redis streams
-    - Step-level logging to Redis via buildlog
+    Uses structured output (Pydantic schema) instead of tools. The LLM returns
+    an array of JobOutputItem with status (pending/drafted/done), filename,
+    filecontent, result, and response. The agent handles each item:
+    - pending: queue message sent back to source
+    - drafted: write file, run validation, optionally re-prompt LLM for edits
+    - done: final response
     """
-
-    MCP_PATH = "/mcp"
 
     def __init__(
         self,
@@ -63,21 +59,21 @@ class Agent:
             return self._system_prompt_override
         return get_editable().get("prompt", "You are a helpful assistant.")
 
-    @classmethod
-    def _gen_tool_url(cls, service_name: str, port: int = 8001) -> str:
-        return f"http://{service_name}:{port}{cls.MCP_PATH}"
-
-    def parse(
+    def _parse(
         self,
         user_message: str,
-        response_format: type[T],
         *,
         model: str | None = None,
         system_prompt: str | None = None,
-    ) -> T:
+        extra_context: str | None = None,
+    ) -> AgentOutput:
         from app.context import build_prefix
+
         prefix = build_prefix()
         augmented = prefix + user_message if prefix else user_message
+        if extra_context:
+            augmented += "\n\n--- Additional Context ---\n" + extra_context + "\n--- End ---"
+
         client = self._client()
         completion = client.beta.chat.completions.parse(
             model=model or self.model,
@@ -85,22 +81,12 @@ class Agent:
                 {"role": "system", "content": system_prompt or self.system_prompt},
                 {"role": "user", "content": augmented},
             ],
-            response_format=response_format,
+            response_format=AgentOutput,
         )
         result = completion.choices[0].message.parsed
         if result is None:
             raise ValueError("Model returned a refusal or unparseable response")
         return result
-
-    def _mcp_client_info(self) -> Implementation:
-        cfg = get_editable()
-        name = cfg.get("agent-name", "agent-dagster")
-        version = get_config().get("static", {}).get("version", "0.0.0")
-        return Implementation(name=name, version=version)
-
-    # ------------------------------------------------------------------
-    # Extended build loop
-    # ------------------------------------------------------------------
 
     def run(
         self,
@@ -111,7 +97,12 @@ class Agent:
         job_name: str = "",
         model: str | None = None,
         system_prompt: str | None = None,
-    ) -> str:
+    ) -> dict:
+        """Run the agent and return a structured result dict.
+
+        Returns a dict with: status, summary, items, run_id (if applicable),
+        build_id, and optionally pending_response for queue routing.
+        """
         return asyncio.run(
             self._arun(
                 user_message,
@@ -132,150 +123,196 @@ class Agent:
         job_name: str = "",
         model: str | None = None,
         system_prompt: str | None = None,
-    ) -> str:
-        from fastmcp import Client
+    ) -> dict:
+        from app.tools import (
+            get_run_status,
+            launch_run,
+            write_pipeline,
+        )
 
         cfg = get_editable()
         timeout = cfg.get("build_timeout_seconds", 600)
         deadline = time.monotonic() + timeout
 
-        prefix, last_ids = build_prefix_with_ids()
-        augmented = prefix + user_message if prefix else user_message
+        log.info(
+            "Build %s: starting structured agent, project=%s, job=%s",
+            build_id or "?",
+            project_name,
+            job_name,
+        )
+        if build_id:
+            buildlog.log_step(
+                build_id, project_name, job_name, "agent_start", "Structured agent started"
+            )
 
-        # -- discover MCP tools ------------------------------------------------
-        mcp_entries: list[dict] = cfg.get("mcp_tools", [])
-        client_info = self._mcp_client_info()
+        max_draft_iterations = 3
+        draft_iteration = 0
+        extra_context: str | None = None
 
-        openai_tools: list[dict] = list(LOCAL_TOOL_SCHEMAS)
-        tool_map: dict[str, tuple[str, str]] = {}
-
-        for entry in mcp_entries:
-            url = self._gen_tool_url(entry["name"], entry.get("port", 8001))
-            try:
-                async with Client(url, client_info=client_info) as mcp_client:
-                    discovered = await mcp_client.list_tools()
-                    for tool in discovered:
-                        qualified = f"{entry['name']}_{tool.name}".replace("-", "_")
-                        tool_map[qualified] = (url, tool.name)
-                        openai_tools.append({
-                            "type": "function",
-                            "function": {
-                                "name": qualified,
-                                "description": tool.description or "",
-                                "parameters": tool.inputSchema,
-                            },
-                        })
-                log.info("Discovered %d tool(s) from %s", len(discovered), url)
-            except Exception:
-                log.warning("MCP server %s unavailable, skipping", url, exc_info=True)
-
-        # -- build initial messages --------------------------------------------
-        messages: list[dict] = [
-            {"role": "system", "content": system_prompt or self.system_prompt},
-            {"role": "user", "content": augmented},
-        ]
-
-        llm = self._client()
-        iteration = 0
-
-        while True:
-            # check timeout
-            if time.monotonic() > deadline:
-                log.warning("Build timeout after %ds", timeout)
-                if build_id:
-                    buildlog.log_step(build_id, project_name, job_name, "build_timeout",
-                                      f"Build timed out after {timeout}s")
-                return json.dumps({
+        while time.monotonic() < deadline:
+            draft_iteration += 1
+            if draft_iteration > max_draft_iterations:
+                log.warning("Build %s: max draft iterations reached", build_id or "?")
+                return {
                     "status": "failed",
-                    "summary": f"Build timed out after {timeout} seconds",
-                })
-
-            # refresh context each iteration
-            if iteration > 0:
-                new_entries, last_ids = get_new_entries(last_ids)
-                if new_entries:
-                    ctx_lines = [f"[{e['stream']}] {e['content']}" for e in new_entries]
-                    ctx_msg = "--- New Context ---\n" + "\n".join(ctx_lines) + "\n--- End New Context ---"
-                    messages.append({"role": "system", "content": ctx_msg})
-                    log.info("Injected %d new context entries at iteration %d", len(new_entries), iteration)
-                    if build_id:
-                        buildlog.log_step(build_id, project_name, job_name, "context_update", ctx_msg)
-
-            iteration += 1
-
-            # LLM call
-            kwargs: dict = {"model": model or self.model, "messages": messages}
-            if openai_tools:
-                kwargs["tools"] = openai_tools
-
-            response = llm.chat.completions.create(**kwargs)
-            choice = response.choices[0]
-            assistant_msg = choice.message
-
-            # log the LLM response
-            if build_id and assistant_msg.content:
-                buildlog.log_step(build_id, project_name, job_name, "llm_response",
-                                  assistant_msg.content[:4000])
-
-            # no tool calls = final answer
-            if not assistant_msg.tool_calls:
-                return assistant_msg.content or ""
-
-            # append assistant message with tool calls
-            msg_dict: dict = {"role": "assistant", "content": assistant_msg.content}
-            msg_dict["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
+                    "summary": "Max validation iterations reached",
+                    "build_id": build_id,
                 }
-                for tc in assistant_msg.tool_calls
-            ]
-            messages.append(msg_dict)
 
-            # dispatch each tool call
-            for tc in assistant_msg.tool_calls:
-                fn_name = tc.function.name
-                arguments = json.loads(tc.function.arguments)
+            try:
+                parsed = self._parse(
+                    user_message,
+                    model=model,
+                    system_prompt=system_prompt,
+                    extra_context=extra_context,
+                )
+            except ValueError as exc:
+                log.exception("Build %s: parse failed", build_id or "?")
+                return {
+                    "status": "failed",
+                    "summary": str(exc),
+                    "build_id": build_id,
+                }
+
+            items = parsed.items or []
+            if not items:
+                return {
+                    "status": "failed",
+                    "summary": "Agent returned no items",
+                    "build_id": build_id,
+                }
+
+            if build_id:
+                buildlog.log_step(
+                    build_id,
+                    project_name,
+                    job_name,
+                    "llm_response",
+                    json.dumps([i.model_dump() for i in items])[:4000],
+                )
+
+            # Check for pending - send back to queue and exit
+            pending_items = [i for i in items if i.status == JobStatus.PENDING]
+            if pending_items:
+                response_text = "; ".join(
+                    i.response or "Need more information" for i in pending_items
+                )
+                log.info("Build %s: pending status, routing to queue", build_id or "?")
+                if build_id:
+                    buildlog.log_step(
+                        build_id, project_name, job_name, "pending", response_text
+                    )
+                return {
+                    "status": "pending",
+                    "summary": response_text,
+                    "response": response_text,
+                    "build_id": build_id,
+                    "pending_response": response_text,
+                }
+
+            # Check for done - final response (use "complete" for queue compatibility)
+            done_items = [i for i in items if i.status == JobStatus.DONE]
+            if done_items and not any(i.status == JobStatus.DRAFTED for i in items):
+                summary = "; ".join(i.response or i.result or "Done" for i in done_items)
+                return {
+                    "status": "complete",
+                    "summary": summary,
+                    "items": [i.model_dump() for i in done_items],
+                    "build_id": build_id,
+                }
+
+            # Handle drafted items: write, validate, possibly re-prompt
+            drafted = [i for i in items if i.status == JobStatus.DRAFTED]
+            if not drafted:
+                # Mixed or unexpected - treat as done
+                summary = "; ".join(
+                    i.response or i.result or str(i.status) for i in items
+                )
+                return {
+                    "status": "complete",
+                    "summary": summary,
+                    "items": [i.model_dump() for i in items],
+                    "build_id": build_id,
+                }
+
+            validation_outputs: list[str] = []
+            for item in drafted:
+                if not item.filename or not item.filecontent:
+                    validation_outputs.append(
+                        f"{item.filename or 'unknown'}: missing filename or filecontent"
+                    )
+                    continue
+
+                # Write file
+                write_result = write_pipeline(
+                    project_name=project_name,
+                    job_name=item.filename,
+                    code=item.filecontent,
+                )
+                write_data = json.loads(write_result)
+                if not write_data.get("success"):
+                    validation_outputs.append(
+                        f"{item.filename}: write failed - {write_data.get('error', write_result)}"
+                    )
+                    continue
 
                 if build_id:
-                    buildlog.log_step(build_id, project_name, job_name, "tool_call",
-                                      json.dumps({"tool": fn_name, "args": arguments})[:4000])
+                    buildlog.log_step(
+                        build_id,
+                        project_name,
+                        job_name,
+                        "write_pipeline",
+                        write_result[:2000],
+                    )
 
-                # local tool
-                if fn_name in LOCAL_TOOLS:
-                    log.info("Calling local tool %s(%s)", fn_name, arguments)
-                    try:
-                        tool_output = LOCAL_TOOLS[fn_name](**arguments)
-                    except Exception as exc:
-                        log.exception("Local tool %s failed", fn_name)
-                        tool_output = json.dumps({"error": str(exc)})
+                # Run validation (val=True for quick test)
+                safe_job = item.filename.replace("-", "_")
+                launch_result = launch_run(
+                    project_name,
+                    safe_job,
+                    run_config={"ops": {"run_etl": {"config": {"val": True}}}},
+                )
+                launch_data = json.loads(launch_result)
+                if not launch_data.get("success"):
+                    validation_outputs.append(
+                        f"{item.filename}: launch failed - {launch_data.get('error', launch_result)}"
+                    )
+                    continue
 
-                # MCP tool
-                elif fn_name in tool_map:
-                    server_url, orig_name = tool_map[fn_name]
-                    log.info("Calling MCP tool %s(%s) on %s", orig_name, arguments, server_url)
-                    try:
-                        async with Client(server_url, client_info=client_info) as mcp_client:
-                            result = await mcp_client.call_tool(orig_name, arguments)
-                        data = result.data if hasattr(result, "data") else result
-                        tool_output = json.dumps(data) if isinstance(data, (dict, list)) else str(data)
-                    except Exception as exc:
-                        log.exception("MCP tool %s failed", orig_name)
-                        tool_output = json.dumps({"error": str(exc)})
+                run_id = launch_data.get("run_id")
+                if build_id:
+                    buildlog.log_step(
+                        build_id,
+                        project_name,
+                        job_name,
+                        "launch_run",
+                        json.dumps({"run_id": run_id, "validation": True}),
+                    )
 
+                # Poll until run completes
+                poll_start = time.monotonic()
+                poll_timeout = 120
+                while time.monotonic() - poll_start < poll_timeout:
+                    status_result = get_run_status(run_id)
+                    status_data = json.loads(status_result)
+                    run_status = status_data.get("status", "").upper()
+                    if run_status in ("SUCCESS", "FAILURE", "CANCELED"):
+                        validation_outputs.append(
+                            f"{item.filename}: run_id={run_id} status={run_status} "
+                            f"stats={status_data.get('stats', {})}"
+                        )
+                        break
+                    await asyncio.sleep(2)
                 else:
-                    tool_output = json.dumps({"error": f"Unknown tool '{fn_name}'"})
+                    validation_outputs.append(
+                        f"{item.filename}: run_id={run_id} timed out waiting for completion"
+                    )
 
-                if build_id:
-                    buildlog.log_step(build_id, project_name, job_name, "tool_result",
-                                      tool_output[:4000])
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tool_output,
-                })
+            # Feed validation output back to LLM for edit decision
+            extra_context = (
+                "Validation run results:\n"
+                + "\n".join(validation_outputs)
+                + "\n\nIf validation failed or produced errors, fix the code and return "
+                "status=drafted with updated filecontent. If validation succeeded, "
+                "return status=done."
+            )

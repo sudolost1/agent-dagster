@@ -62,6 +62,7 @@ run_launcher:
     container_kwargs:
       volumes:
         - /tmp/io_manager_storage:/tmp/io_manager_storage
+        - 2wa_duckdb_data:/data/duckdb
       auto_remove: true
 
 run_coordinator:

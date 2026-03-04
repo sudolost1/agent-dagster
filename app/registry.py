@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import threading
 import time
@@ -48,8 +49,8 @@ def _heartbeat_loop(client: redis_lib.Redis, service_type: str) -> None:
 
 def start_heartbeat(service_type: str = "agent") -> None:
     cfg = get_editable()
-    host = cfg.get("redis_host", "cache")
-    port = int(cfg.get("redis_port", 6379))
+    host = os.environ.get("REDIS_HOST") or cfg.get("redis_host", "cache")
+    port = int(os.environ.get("REDIS_PORT") or cfg.get("redis_port", 6379))
     client = redis_lib.Redis(host=host, port=port, decode_responses=True)
 
     key, data = _build_entry(service_type)

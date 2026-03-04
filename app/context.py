@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import redis as redis_lib
@@ -15,8 +16,8 @@ _client: redis_lib.Redis | None = None
 def _get_client() -> redis_lib.Redis:
     global _client
     cfg = get_editable()
-    host = cfg.get("redis_host", "cache")
-    port = int(cfg.get("redis_port", 6379))
+    host = os.environ.get("REDIS_HOST") or cfg.get("redis_host", "cache")
+    port = int(os.environ.get("REDIS_PORT") or cfg.get("redis_port", 6379))
     if _client is None:
         _client = redis_lib.Redis(host=host, port=port, decode_responses=True)
     return _client
