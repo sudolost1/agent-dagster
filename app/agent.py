@@ -289,14 +289,16 @@ class Agent:
                         json.dumps({"run_id": run_id, "validation": True}),
                     )
 
-                # Poll until run completes
+                # Poll until validation run completes
                 poll_start = time.monotonic()
                 poll_timeout = 120
+                validation_succeeded = False
                 while time.monotonic() - poll_start < poll_timeout:
                     status_result = get_run_status(run_id)
                     status_data = json.loads(status_result)
                     run_status = status_data.get("status", "").upper()
                     if run_status in ("SUCCESS", "FAILURE", "CANCELED"):
+                        validation_succeeded = run_status == "SUCCESS"
                         validation_outputs.append(
                             f"{item.filename}: run_id={run_id} status={run_status} "
                             f"stats={status_data.get('stats', {})}"
@@ -307,6 +309,47 @@ class Agent:
                     validation_outputs.append(
                         f"{item.filename}: run_id={run_id} timed out waiting for completion"
                     )
+
+                # Materialize: full run after validation passes
+                if validation_succeeded:
+                    mat_result = launch_run(
+                        project_name,
+                        safe_job,
+                        run_config={"ops": {"run_etl": {"config": {"val": False}}}},
+                    )
+                    mat_data = json.loads(mat_result)
+                    if mat_data.get("success"):
+                        mat_run_id = mat_data.get("run_id")
+                        if build_id:
+                            buildlog.log_step(
+                                build_id,
+                                project_name,
+                                job_name,
+                                "launch_run",
+                                json.dumps({"run_id": mat_run_id, "materialize": True}),
+                            )
+                        mat_poll_start = time.monotonic()
+                        mat_poll_timeout = cfg.get("materialize_timeout_seconds", 600)
+                        while time.monotonic() - mat_poll_start < mat_poll_timeout:
+                            mat_status = get_run_status(mat_run_id)
+                            mat_status_data = json.loads(mat_status)
+                            mat_run_status = mat_status_data.get("status", "").upper()
+                            if mat_run_status in ("SUCCESS", "FAILURE", "CANCELED"):
+                                validation_outputs.append(
+                                    f"{item.filename}: materialize run_id={mat_run_id} "
+                                    f"status={mat_run_status}"
+                                )
+                                break
+                            await asyncio.sleep(2)
+                        else:
+                            validation_outputs.append(
+                                f"{item.filename}: materialize run_id={mat_run_id} timed out"
+                            )
+                    else:
+                        validation_outputs.append(
+                            f"{item.filename}: materialize launch failed - "
+                            f"{mat_data.get('error', mat_result)}"
+                        )
 
             # Feed validation output back to LLM for edit decision
             extra_context = (

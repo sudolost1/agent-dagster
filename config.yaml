@@ -3,6 +3,7 @@ editable:
   api-key: none
   base_url: http://10.0.0.208:11434/v1
   build_timeout_seconds: 600
+  materialize_timeout_seconds: 600
   contexts:
   - '*'
   - agent-dagster

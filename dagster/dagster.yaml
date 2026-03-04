@@ -63,6 +63,7 @@ run_launcher:
       volumes:
         - /tmp/io_manager_storage:/tmp/io_manager_storage
         - 2wa_duckdb_data:/data/duckdb
+        - 2wa_pipelines:/opt/dagster/app/pipelines
       auto_remove: true
 
 run_coordinator:
