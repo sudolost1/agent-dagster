@@ -1,10 +1,4 @@
-"""Dynamic Dagster code location.
-
-Walks the pipelines volume directory, imports every Python module it finds,
-and collects all @job-decorated objects into a single Definitions.
-This file is used by the code-server (gRPC) and by DockerRunLauncher
-containers.
-"""
+"""Dagster code location. Dynamically discovers @job definitions from the pipelines volume at import time."""
 from __future__ import annotations
 
 import importlib.util
@@ -21,6 +15,7 @@ PIPELINES_DIR = os.environ.get("PIPELINES_DIR", "/opt/dagster/app/pipelines")
 
 
 def _discover_jobs(base_dir: str) -> list[JobDefinition]:
+    """Walk the pipelines directory, import all modules, and collect JobDefinition objects."""
     jobs: list[JobDefinition] = []
     base = Path(base_dir)
     if not base.is_dir():

@@ -1,3 +1,5 @@
+"""Redis Streams context reader. Extends agent-base with incremental reads via build_prefix_with_ids and get_new_entries."""
+
 from __future__ import annotations
 
 import logging
@@ -14,6 +16,7 @@ _client: redis_lib.Redis | None = None
 
 
 def _get_client() -> redis_lib.Redis:
+    """Lazy-init Redis client singleton from editable config."""
     global _client
     cfg = get_editable()
     host = os.environ.get("REDIS_HOST") or cfg.get("redis_host", "cache")

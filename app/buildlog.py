@@ -1,3 +1,5 @@
+"""Build log persistence. Redis-backed build metadata, step lists, and sorted index. Identical to agent-airflow."""
+
 from __future__ import annotations
 
 import json
@@ -12,23 +14,28 @@ MAX_STEPS = 5000
 
 
 def init_redis(client: redis_lib.Redis) -> None:
+    """Set the Redis client for build log storage."""
     global _redis
     _redis = client
 
 
 def _meta_key(project: str, job: str, build_id: str) -> str:
+    """Redis hash key for build metadata."""
     return f"builds:meta:{project}:{job}:{build_id}"
 
 
 def _steps_key(project: str, job: str, build_id: str) -> str:
+    """Redis list key for build step entries."""
     return f"builds:steps:{project}:{job}:{build_id}"
 
 
 def _index_key() -> str:
+    """Redis sorted set key for the global build index."""
     return "builds:index"
 
 
 def _composite(project: str, job: str, build_id: str) -> str:
+    """Composite key string: project:job:build_id."""
     return f"{project}:{job}:{build_id}"
 
 
@@ -38,6 +45,7 @@ def start_build(
     job_name: str,
     container_id: str,
 ) -> None:
+    """Create build metadata hash and add to sorted index."""
     if _redis is None:
         return
     now = datetime.now(tz=timezone.utc).isoformat()
@@ -61,6 +69,7 @@ def log_step(
     step_type: str,
     content: str,
 ) -> None:
+    """Append a timestamped step entry to the build's step list."""
     if _redis is None:
         return
     entry = json.dumps({
@@ -79,6 +88,7 @@ def finish_build(
     job_name: str,
     status: str,
 ) -> None:
+    """Mark build as complete/failed and record finish time."""
     if _redis is None:
         return
     key = _meta_key(project_name, job_name, build_id)
@@ -89,6 +99,7 @@ def finish_build(
 
 
 def get_build_log(project_name: str, job_name: str, build_id: str) -> dict:
+    """Return build metadata and all step entries."""
     if _redis is None:
         return {"meta": {}, "steps": []}
     meta_key = _meta_key(project_name, job_name, build_id)
@@ -100,6 +111,7 @@ def get_build_log(project_name: str, job_name: str, build_id: str) -> dict:
 
 
 def list_builds(limit: int = 50) -> list[dict]:
+    """Return recent builds from the global sorted index."""
     if _redis is None:
         return []
     entries = _redis.zrevrange(_index_key(), 0, limit - 1)
@@ -116,6 +128,7 @@ def list_builds(limit: int = 50) -> list[dict]:
 
 
 def list_builds_for_job(project_name: str, job_name: str, limit: int = 50) -> list[dict]:
+    """Return recent builds filtered by project and job."""
     if _redis is None:
         return []
     pattern = _meta_key(project_name, job_name, "*")

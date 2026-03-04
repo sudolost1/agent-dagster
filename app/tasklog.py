@@ -1,3 +1,5 @@
+"""Task completion log. Redis-backed list of completed task records. Identical to agent-base."""
+
 from __future__ import annotations
 
 import json

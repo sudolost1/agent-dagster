@@ -1,3 +1,5 @@
+"""Application log buffer. Redis-backed logging.Handler with local deque fallback. Identical to agent-base."""
+
 from __future__ import annotations
 
 import json

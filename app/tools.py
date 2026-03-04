@@ -1,3 +1,5 @@
+"""Dagster tool implementations. Four tools: test_connection (SQLAlchemy), write_pipeline, launch_run, get_run_status (Dagster GraphQL)."""
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -16,10 +18,12 @@ TEST_CONNECTION_TIMEOUT = 15
 
 
 def _pipelines_dir() -> Path:
+    """Return the configured pipelines volume path."""
     return Path(get_editable().get("pipelines_dir", PIPELINES_DIR_DEFAULT))
 
 
 def _graphql_url() -> str:
+    """Return the Dagster GraphQL endpoint URL from config."""
     return get_editable().get("dagster_graphql_url", "http://dagster-webserver:3000/graphql")
 
 
@@ -40,7 +44,7 @@ _DRIVER_MAP = {
 def _connection_string(
     type: str, host: str, port: int, database: str, user: str, password: str
 ) -> str:
-    """Build SQLAlchemy URL (same format as dlt sql_database)."""
+    """Build a SQLAlchemy connection string from component parts."""
     from urllib.parse import quote_plus
 
     driver = _DRIVER_MAP.get(type.lower() if type else "", "")
@@ -51,6 +55,7 @@ def _connection_string(
 
 
 def _do_test_connection(type: str, host: str, port: int, database: str, user: str, password: str) -> str:
+    """Execute a test query against the database. Returns JSON result string."""
     from sqlalchemy import create_engine, text
 
     url = _connection_string(type, host, port, database, user, password)
@@ -64,7 +69,7 @@ def _do_test_connection(type: str, host: str, port: int, database: str, user: st
 
 
 def test_connection(type: str, host: str, port: int, database: str, user: str, password: str) -> str:
-    """Test a database connection using SQLAlchemy (dlt-compatible format). Supports postgres, mysql."""
+    """Validate database connectivity via SQLAlchemy test query."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         future = ex.submit(_do_test_connection, type, host, port, database, user, password)
         try:
@@ -104,7 +109,7 @@ TEST_CONNECTION_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def write_pipeline(project_name: str, job_name: str, code: str) -> str:
-    """Validate syntax and write a Dagster pipeline file to the persistent volume."""
+    """Syntax-check and write a Python pipeline file to the shared volume."""
     safe_project = project_name.replace("/", "_").replace("..", "_")
     safe_job = job_name.replace("/", "_").replace("..", "_")
 
@@ -152,6 +157,7 @@ WRITE_PIPELINE_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def _graphql_request(query: str, variables: dict | None = None) -> dict:
+    """Send a GraphQL request to the Dagster webserver."""
     payload = json.dumps({"query": query, "variables": variables or {}}).encode()
     req = urllib.request.Request(
         _graphql_url(),
@@ -168,10 +174,7 @@ def launch_run(
     *,
     run_config: dict | None = None,
 ) -> str:
-    """Launch a Dagster job run via the GraphQL API.
-
-    Pass run_config={"val": True} for validation mode (quick test run).
-    """
+    """Trigger a Dagster job run via GraphQL launchRun mutation."""
     safe_job = job_name.replace("-", "_")
     query = """
     mutation LaunchRun($selector: JobOrPipelineSelector!, $runConfigData: RunConfigData) {
@@ -235,7 +238,7 @@ LAUNCH_RUN_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 def get_run_status(run_id: str) -> str:
-    """Query a Dagster run's status and recent log events."""
+    """Poll a Dagster run's status and logs via GraphQL."""
     query = """
     query RunStatus($runId: ID!) {
       runOrError(runId: $runId) {

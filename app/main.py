@@ -1,3 +1,5 @@
+"""Entrypoint. FastAPI app with build-tracking RabbitMQ consumer and dual thread pools for task dispatch."""
+
 from __future__ import annotations
 
 import concurrent.futures
@@ -34,11 +36,13 @@ agent = Agent()
 
 
 def _queue_name() -> str:
+    """Derive RabbitMQ queue name from config agent-name."""
     name = get_editable().get("agent-name", "agent-dagster")
     return f"q.tasks.{name}"
 
 
 def _connect(host: str, user: str = "guest", password: str = "guest") -> pika.BlockingConnection:
+    """Connect to RabbitMQ with exponential back-off retries."""
     credentials = pika.PlainCredentials(user, password)
     params = pika.ConnectionParameters(
         host=host,
@@ -63,6 +67,7 @@ _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
 
 def _build_response(payload: dict, response_obj: dict, agent_name: str) -> str:
+    """Wrap agent result into a JSON response payload for the source queue."""
     return json.dumps({
         "task": payload,
         "response": response_obj,
@@ -78,7 +83,7 @@ def _process_task(
     payload: dict,
     build_id: str,
 ) -> None:
-    """Run in worker thread so the connection thread stays responsive for heartbeats."""
+    """Run agent with build lifecycle tracking and response publishing."""
     cfg = get_editable()
     timeout = cfg.get("task_timeout_seconds", 600)
     agent_name = cfg.get("agent-name", "agent-dagster")
@@ -168,7 +173,7 @@ def _on_message(
     _properties: pika.spec.BasicProperties,
     body: bytes,
 ) -> None:
-    """Dispatch to worker thread immediately so connection thread can send heartbeats."""
+    """RabbitMQ callback. Validates payload, generates build ID, submits to executor."""
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -198,6 +203,7 @@ def _on_message(
 
 
 def _consume() -> None:
+    """Background thread. Connects to RabbitMQ, declares quorum queue, starts consuming."""
     cfg = get_editable()
     host = cfg.get("rabbitmq_host", "rabbitmq")
     user = cfg.get("rabbitmq_user", "guest")
@@ -225,6 +231,7 @@ def _consume() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """FastAPI lifespan. Inits all Redis subsystems, loads context, starts heartbeat and consumer."""
     load_config()
     cfg = get_editable()
     redis_client = redis_lib.Redis(

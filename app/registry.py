@@ -1,3 +1,5 @@
+"""Service registry. TTL-expiring Redis hash with background heartbeat. Identical to agent-base."""
+
 from __future__ import annotations
 
 import logging
@@ -17,6 +19,7 @@ HEARTBEAT_INTERVAL = 15
 
 
 def _build_entry(service_type: str) -> tuple[str, dict[str, str]]:
+    """Build Redis key and hash data for this service instance."""
     cfg = get_editable()
     static = get_config().get("static", {})
     hostname = socket.gethostname()
@@ -36,6 +39,7 @@ def _build_entry(service_type: str) -> tuple[str, dict[str, str]]:
 
 
 def _heartbeat_loop(client: redis_lib.Redis, service_type: str) -> None:
+    """Daemon loop: re-publish registry entry every HEARTBEAT_INTERVAL seconds."""
     while True:
         try:
             key, data = _build_entry(service_type)
@@ -48,6 +52,7 @@ def _heartbeat_loop(client: redis_lib.Redis, service_type: str) -> None:
 
 
 def start_heartbeat(service_type: str = "agent") -> None:
+    """Register this service and start the background heartbeat thread."""
     cfg = get_editable()
     host = os.environ.get("REDIS_HOST") or cfg.get("redis_host", "cache")
     port = int(os.environ.get("REDIS_PORT") or cfg.get("redis_port", 6379))

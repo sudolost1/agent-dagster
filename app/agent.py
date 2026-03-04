@@ -1,4 +1,4 @@
-"""Dagster pipeline builder agent using structured output (no tools)."""
+"""Dagster pipeline builder agent. Structured output parsing + write→validate→materialize loop using Dagster tools."""
 
 from __future__ import annotations
 
@@ -18,15 +18,7 @@ log = logging.getLogger(__name__)
 
 
 class Agent:
-    """Dagster pipeline builder agent.
-
-    Uses structured output (Pydantic schema) instead of tools. The LLM returns
-    an array of JobOutputItem with status (pending/drafted/done), filename,
-    filecontent, result, and response. The agent handles each item:
-    - pending: queue message sent back to source
-    - drafted: write file, run validation, optionally re-prompt LLM for edits
-    - done: final response
-    """
+    """Orchestrates pipeline generation via LLM structured output and Dagster validation runs."""
 
     def __init__(
         self,
@@ -35,12 +27,14 @@ class Agent:
         model: str | None = None,
         system_prompt: str | None = None,
     ):
+        """Initialize with optional LLM config overrides."""
         self._api_key = api_key
         self._base_url_override = base_url
         self._model_override = model
         self._system_prompt_override = system_prompt
 
     def _client(self) -> OpenAI:
+        """Create OpenAI client from current config."""
         cfg = get_editable()
         return OpenAI(
             api_key=self._api_key,
@@ -49,12 +43,14 @@ class Agent:
 
     @property
     def model(self) -> str:
+        """Active model name from override or config."""
         if self._model_override:
             return self._model_override
         return get_editable().get("model", "gpt-4o")
 
     @property
     def system_prompt(self) -> str:
+        """Active system prompt from override or config."""
         if self._system_prompt_override:
             return self._system_prompt_override
         return get_editable().get("prompt", "You are a helpful assistant.")
@@ -67,6 +63,7 @@ class Agent:
         system_prompt: str | None = None,
         extra_context: str | None = None,
     ) -> AgentOutput:
+        """Call LLM with structured output parsing to get AgentOutput."""
         from app.context import build_prefix
 
         prefix = build_prefix()
@@ -98,11 +95,7 @@ class Agent:
         model: str | None = None,
         system_prompt: str | None = None,
     ) -> dict:
-        """Run the agent and return a structured result dict.
-
-        Returns a dict with: status, summary, items, run_id (if applicable),
-        build_id, and optionally pending_response for queue routing.
-        """
+        """Sync wrapper for the async agent loop. Returns result dict with status, summary, items."""
         return asyncio.run(
             self._arun(
                 user_message,
@@ -124,6 +117,7 @@ class Agent:
         model: str | None = None,
         system_prompt: str | None = None,
     ) -> dict:
+        """Async agent loop: parse→write→validate→materialize→re-prompt, up to 3 iterations."""
         from app.tools import (
             get_run_status,
             launch_run,

@@ -1,4 +1,4 @@
-"""Structured output schema for the Dagster pipeline builder agent."""
+"""Pydantic schemas for the Dagster agent's structured output. Defines the three-state (pending/drafted/done) pipeline lifecycle."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class JobStatus(str, Enum):
-    """Status of a job output item."""
+    """Pipeline item lifecycle state."""
 
     PENDING = "pending"
     DRAFTED = "drafted"
@@ -16,11 +16,7 @@ class JobStatus(str, Enum):
 
 
 class JobOutputItem(BaseModel):
-    """Single item in the agent's structured output.
-
-    The agent may return multiple items when it decides to write several
-    files to complete a task.
-    """
+    """Single pipeline item with status, generated code, and validation result."""
 
     status: JobStatus = Field(
         description="pending = need more info, drafted = file ready for validation, done = complete"
@@ -44,11 +40,7 @@ class JobOutputItem(BaseModel):
 
 
 class AgentOutput(BaseModel):
-    """Root structured output from the agent.
-
-    Contains an array of job output items. The agent may produce multiple
-    files in a single response.
-    """
+    """LLM structured response containing a list of pipeline items."""
 
     items: list[JobOutputItem] = Field(
         default_factory=list,

@@ -1,3 +1,5 @@
+"""REST API router. Base endpoints plus /build-logs for per-project/job build history."""
+
 from __future__ import annotations
 
 import base64
